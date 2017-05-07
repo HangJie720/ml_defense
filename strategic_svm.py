@@ -1,98 +1,92 @@
 import numpy as np
 import argparse
-from sklearn import svm
-from sklearn.decomposition import PCA
+import subprocess
+import os
 
 from lib.utils.svm_utils import *
-from lib.utils.data_utils import *
+from lib.utils.data_utils import load_dataset, get_data_shape
 from lib.utils.dr_utils import *
+from lib.attacks.svm_attacks import *
 
 #------------------------------------------------------------------------------#
-def mult_cls_atk(clf, X_test, dev_mag, rd=None, rev=None):
 
-    """
-    Returns
-    (1) Adversarial samples generated from <X_test> for linear SVM <clf>
-        with perturbation magnitude <dev_mag>
-    (2) Predicted labels of <X_test> by <clf>
-    """
 
-    test_len = len(X_test)
-    X_adv = np.zeros((test_len, X_test.shape[1]))
-    y_ini = np.zeros(test_len)
-    classes = clf.intercept_.shape[0]
-
-    for i in range(test_len):
-        x_ini = X_test[i,:].reshape(1, -1)
-        ini_class = clf.predict(x_ini)
-        w = clf.coef_[ini_class[0],:]
-        d_list = []
-        i_list = []
-        distances = clf.decision_function(x_ini)
-        for j in range(classes):
-            if j == ini_class[0]: continue
-            w_curr = clf.coef_[j,:]
-            d_list.append(abs(distances[0,j] - distances[0,ini_class[0]])
-                          /np.linalg.norm(w_curr - w))
-            i_list.append(j)
-            i_d_list = zip(i_list, d_list)
-        i_d_list = sorted(i_d_list, key = lambda x:x[1])
-        min_index = i_d_list[0][0]
-        min_dist = i_d_list[0][1]
-        w_min = clf.coef_[min_index,:]
-        x_adv = (x_ini - dev_mag*((w - w_min)/(np.linalg.norm(w - w_min))))
-        if rd == None or rev != None: np.clip(x_adv, 0, 1)
-        X_adv[i,:] = x_adv
-        y_ini[i] = ini_class
-
-    return X_adv, y_ini
-#------------------------------------------------------------------------------#
-
-#------------------------------------------------------------------------------#
 def main(argv):
+    """
+    Main function to run strategic_svm.py. Set up SVM classifier, perform
+    and evaluate attack, deploy defense and perform strategic attack. Resutls
+    and adv. sample images are also saved on each task.
+    """
 
     # Parse arguments and store in model_dict
     model_dict = svm_model_dict_create()
     DR = model_dict['dim_red']
-    rev_flag = None
+    rev_flag = model_dict['rev']
+    strat_flag = 1
 
     # Load dataset and create data_dict to store metadata
     print('Loading data...')
-    X_train, y_train, X_val, y_val, X_test, y_test = load_dataset(model_dict)
+    dataset = model_dict['dataset']
+    if (dataset == 'MNIST') or (dataset == 'GTSRB'):
+        X_train, y_train, X_val, y_val, X_test, y_test = load_dataset(
+            model_dict)
+        img_flag = None
+    elif dataset == 'HAR':
+        X_train, y_train, X_test, y_test = load_dataset(model_dict)
+        img_flag = None
     # TODO: 2 classes case
     # if model_dict['classes'] == 2:
     #     X_train = X_train
-    data_dict = get_data_shape(X_train, X_test, X_val)
+
+    data_dict = get_data_shape(X_train, X_test)
     n_features = data_dict['no_of_features']
 
     # Reshape dataset to have dimensions suitable for SVM
     X_train_flat = X_train.reshape(-1, n_features)
     X_test_flat = X_test.reshape(-1, n_features)
-    X_val_flat = X_val.reshape(-1, n_features)
+    # Center dataset with mean of training set
+    mean = np.mean(X_train_flat, axis=0)
+    X_train_flat -= mean
+    X_test_flat -= mean
 
     # Create a new model or load an existing one
     clf = model_creator(model_dict, X_train_flat, y_train)
     model_tester(model_dict, clf, X_test_flat, y_test)
 
     # Assign parameters
-    n_mag = 10                                  # No. of deviations to consider
-    dev_list = np.linspace(0.1, 1.0, n_mag)    # A list of deviations mag.
-    # rd_list = [784, 331, 200, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10]    # Reduced dimensions to use
-    rd_list = [784, 100]
+    n_mag = 25                                 # No. of deviations to consider
+    dev_list = np.linspace(0.1, 2.5, n_mag)    # A list of deviations mag.
+    if dataset == 'MNIST':
+        rd_list = [784, 331, 200, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10]    # Reduced dimensions to use
+        # rd_list = [784]
+    elif dataset == 'HAR':
+        rd_list = [561, 200, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10]
+        # rd_list = [561]
     n_rd = len(rd_list)
     output_list = []
+    clear_flag = None
+    # Clear old output files
+    if clear_flag ==1:
+        abs_path_o = resolve_path_o(model_dict)
+        _, fname = file_create(model_dict)
+        os.remove(abs_path_o + fname + '.txt')
+        _, fname = file_create(model_dict, rd=1, strat=strat_flag, rev=rev_flag)
+        os.remove(abs_path_o + fname + '.txt')
 
     # Test clf against adv. samples
     print('Performing attack...')
     if model_dict['classes'] != 2:
         for i in range(n_mag):
-            X_adv, y_ini = mult_cls_atk(clf, X_test_flat, dev_list[i])
+            X_adv, y_ini = mult_cls_atk(clf, X_test_flat, mean, dev_list[i])
             output_list.append(acc_calc_all(clf, X_adv, y_test, y_ini))
-            save_svm_images(model_dict, n_features, X_test, X_adv, dev_list[i])
-        print_svm_output(model_dict, output_list, dev_list)
-    else:
-        # TODO: 2 classes
-        print('TODO')
+            if img_flag != None:
+                save_svm_images(model_dict, data_dict, X_test, X_adv,
+                                dev_list[i])
+        fname = print_svm_output(model_dict, output_list, dev_list)
+        # subprocess.call(["gnuplot -e \"filename='{}.png'; in_name='{}.txt'\" gnu_in_loop.plg".format(fname,fname)], shell=True)
+    # else:
+    #     # TODO: 2 classes
+    #     print('TODO')
 
     # Retrain defense and strategic attack
     print('--------------Retrain Defense & Strategic Attack--------------')
@@ -101,34 +95,52 @@ def main(argv):
         print('Reduced dimensions: {}'.format(rd))
 
         # Dimension reduce dataset and reshape
-        if DR == 'pca':
-            X_train_dr, X_test_dr, pca = pca_dr(X_train_flat, X_test_flat, rd)
-        elif DR == 'rp':
-            X_train_dr, X_test_dr, grp = random_proj_dr(X_train_flat,
-                                                        X_test_flat, rd)
-        X_train_dr = X_train_dr.reshape(-1, rd)
-        X_test_dr = X_test_dr.reshape(-1, rd)
+        X_train_dr, _, dr_alg = dr_wrapper(
+            X_train_flat, X_test_flat, DR, rd, y_train, rev=rev_flag)
 
         # With dimension reduced dataset, create new model or load existing one
-        clf = model_creator(model_dict, X_train_dr, y_train, rd)
-        model_tester(model_dict, clf, X_test_dr, y_test)
+        clf = model_creator(model_dict, X_train_dr, y_train, rd, rev_flag)
+        # Modify classifier to include transformation matrix
+        clf = model_transform(model_dict, clf, dr_alg)
+
+        model_tester(model_dict, clf, X_test_flat, y_test, rd, rev_flag)
+
+        # rev_flag = 1
+        # model_dict['rev'] = rev_flag
+        # # Dimension reduce dataset and reshape
+        # X_train_dr, _, dr_alg = dr_wrapper(
+        #     X_train_flat, X_test_flat, DR, rd, y_train, rev=rev_flag)
+        #
+        # # With dimension reduced dataset, create new model or load existing one
+        # clf_1 = model_creator(model_dict, X_train_dr, y_train, rd, rev_flag)
+        # # Modify classifier to include transformation matrix
+        # clf_1 = model_transform(model_dict, clf_1, dr_alg)
+        # # Test model on original data
+        # model_tester(model_dict, clf_1, X_test_flat, y_test, rd, rev_flag)
+        #
+        # print clf_1.coef_[0]-clf.coef_[0]
+        # print np.linalg.norm(clf_1.coef_[0]), np.linalg.norm(clf.coef_[0])
+        # print np.dot(clf_1.coef_[0],clf.coef_[0])/(np.linalg.norm(clf_1.coef_[0])*np.linalg.norm(clf.coef_[0]))
 
         # Strategic attack: create new adv samples based on retrained clf
         print('Performing strategic attack...')
         for i in range(n_mag):
-            X_adv, y_ini = mult_cls_atk(clf, X_test_dr, dev_list[i], rd,
-                                                                    rev_flag)
+            X_adv, y_ini = mult_cls_atk(clf, X_test_flat, mean, dev_list[i])
             output_list.append(acc_calc_all(clf, X_adv, y_test, y_ini))
-            if model_dict['dim_red']=='pca' or model_dict['dim_red']==None:
-                dr_alg = pca
-                save_svm_images(model_dict, n_features, X_test_dr, X_adv,
-                                    dev_list[i], rd, dr_alg)
-        print_svm_output(model_dict, output_list, dev_list, rd, strat_flag=1)
+            if img_flag != None:
+                save_svm_images(model_dict, data_dict, X_test_flat, X_adv,
+                            dev_list[i], rd, dr_alg, rev_flag)
 
-    # TODO: Plot
-    # plotter(acc_recons, acc_no_def, dev_list, rd_list, recons_flag=1, strat_flag=0)
-    # plotter(acc_retrain, acc_no_def, dev_list, rd_list, recons_flag=0, strat_flag=0)
-    # plotter(acc_strat, acc_no_def, dev_list, rd_list, recons_flag=0, strat_flag=1)
+        fname = print_svm_output(model_dict, output_list, dev_list, rd,
+                                 strat_flag, rev_flag)
 
+    # fname = dataset +'_' + fname
+    subprocess.call(
+        ["gnuplot -e \"mname='{}'\" gnu_in_loop.plg".format(fname)], shell=True)
+#------------------------------------------------------------------------------#
+
+
+#------------------------------------------------------------------------------#
 if __name__ == "__main__":
-   main(sys.argv[1:])
+    main(sys.argv[1:])
+#------------------------------------------------------------------------------#
